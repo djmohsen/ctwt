@@ -1,0 +1,114 @@
+name: Build iOS App
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Install CocoaPods dependencies
+        run: |
+          gem install cocoapods
+          pod install
+
+      - name: Build Debug App
+        if: github.event.inputs.build_type == 'debug' || github.event_name != 'workflow_dispatch'
+        run: |
+          xcodebuild build \
+            -workspace Chatwoot.xcworkspace \
+            -scheme Chatwoot \
+            -configuration Debug \
+            -derivedDataPath build \
+            -verbose
+
+      - name: Setup signing
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          # Create temporary keychain
+          security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain || true
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+          
+          # Import certificate
+          echo "${{ secrets.IOS_CERTIFICATE_P12 }}" | base64 -d > certificate.p12
+          security import certificate.p12 \
+            -k build.keychain \
+            -P "${{ secrets.IOS_CERTIFICATE_PASSWORD }}" \
+            -A
+          security set-key-partition-list -S apple-tool:,apple: -k "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+          rm certificate.p12
+          
+          # Setup provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.IOS_PROVISIONING_PROFILE }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+      - name: Build Release App
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          xcodebuild build \
+            -workspace Chatwoot.xcworkspace \
+            -scheme Chatwoot \
+            -configuration Release \
+            -derivedDataPath build \
+            -verbose \
+            -allowProvisioningUpdates
+
+      - name: Create IPA
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          mkdir -p Payload
+          cp -r build/Release-iphoneos/Chatwoot.app Payload/
+          zip -r Chatwoot.ipa Payload/
+          rm -rf Payload
+
+      - name: Upload Debug Build
+        if: github.event.inputs.build_type == 'debug' || github.event_name != 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatwoot-debug-ios
+          path: build/Debug-iphoneos/
+          retention-days: 30
+
+      - name: Upload Release IPA
+        if: github.event.inputs.build_type == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatwoot-release-ipa
+          path: Chatwoot.ipa
+          retention-days: 90
+
+      - name: Create GitHub Release
+        if: github.event.inputs.build_type == 'release' && github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Chatwoot.ipa
+          tag_name: ios-v${{ github.run_number }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
